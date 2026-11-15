@@ -1113,6 +1113,33 @@ def attach_many(note: dict, entries: list[dict], sentence_field: str, audio_fiel
     return f"{media_name} -> {field}"
 
 
+def backlog_tts(limit: int) -> list[int]:
+    """Cards mined earlier that still have no sentence audio at all.
+
+    The per-minute job normally only looks at today's cards; without this the
+    older ones would stay silent forever.
+    """
+    if limit <= 0:
+        return []
+    try:
+        note_ids = anki("findNotes", query="tag:GSM") or []
+    except (urllib.error.URLError, RuntimeError, OSError):
+        return []
+    if not note_ids:
+        return []
+    out: list[int] = []
+    for note in anki("notesInfo", notes=note_ids):
+        fields = note.get("fields") or {}
+        audio_field = pick_field(fields, "Sentence Audio")
+        current = fields.get(audio_field, {}).get("value", "") if audio_field else ""
+        if current.strip():
+            continue
+        if not fields.get("Sentence", {}).get("value", "").strip():
+            continue
+        out.append(int(note["noteId"]))
+    return sorted(out, reverse=True)[:limit]
+
+
 # ------------------------------------------------------------------------ main
 
 
@@ -1225,6 +1252,10 @@ def main():
         if (not sentence_has_audio and sentence) or word_empty:
             tts_ids.append(int(note["noteId"]))
 
+    if not tts_ids:
+        tts_ids = backlog_tts(tts_limit)
+        if tts_ids:
+            log(f"backlog: voicing {len(tts_ids)} older card(s) without audio")
     if tts_ids:
         run_tts(tts_ids[:tts_limit])
 
