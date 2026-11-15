@@ -48,6 +48,7 @@ TTS_FILE = APP_DIR / "gv_tts.json"
 TTS_LOCK = APP_DIR / "gv_tts.lock"
 ASR_FILE = APP_DIR / "gv_asr.json"
 ASR_CACHE = APP_DIR / "gv_asr_cache.json"
+VOICE_ASR = APP_DIR / "gv_voice_asr.json"
 LOG_FILE = APP_DIR / "gv_log.txt"
 ANKI_URL = "http://127.0.0.1:8765"
 MAP_MAX_AGE = 6 * 3600
@@ -507,6 +508,74 @@ def asr_verify(pairs, resolver, game_dir: Path, config: dict) -> tuple[float, in
     return sum(scores) / len(scores), len(scores)
 
 
+def voice_asr_index() -> dict:
+    try:
+        data = json.loads(VOICE_ASR.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_voice_asr_index(data: dict) -> None:
+    try:
+        VOICE_ASR.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def asr_scan(game_dir: Path, known: set[Path], config: dict) -> list[dict]:
+    """Listen to voice files that no message event pointed at.
+
+    Some games play a line's voice from a plugin call or a common event, so no
+    `Play SE` sits next to the text and the file would stay unused forever.
+    We transcribe those leftovers once (a budget per run) and index what they
+    actually say, so the line can still be matched later.
+    """
+    if not config.get("enabled"):
+        return []
+    audio_root = game_dir / "audio"
+    if not audio_root.is_dir():
+        return []
+    budget = int(config.get("scan_per_run") or 40)
+    cache = voice_asr_index()
+    model = str(config.get("model") or "large-v3-turbo")
+    names = {p.resolve() for p in known}
+    todo: list[Path] = []
+    for path in sorted(p for p in audio_root.rglob("*") if p.suffix.lower() in AUDIO_EXTS):
+        if path.resolve() in names:
+            continue
+        item = cache.get(str(path))
+        try:
+            mtime = int(path.stat().st_mtime)
+        except OSError:
+            continue
+        if isinstance(item, dict) and item.get("mtime") == mtime and item.get("text"):
+            continue
+        todo.append(path)
+        if len(todo) >= budget:
+            break
+    if todo:
+        log(f"asr scan {game_dir.name}: listening to {len(todo)} unused voice file(s)")
+        for path, text in asr_transcribe(todo, config).items():
+            audio = Path(path)
+            try:
+                mtime = int(audio.stat().st_mtime)
+            except OSError:
+                mtime = 0
+            cache[str(audio)] = {"mtime": mtime, "text": (text or "").strip()}
+        save_voice_asr_index(cache)
+    out = []
+    for path in sorted(p for p in audio_root.rglob("*") if p.suffix.lower() in AUDIO_EXTS):
+        item = cache.get(str(path))
+        if not isinstance(item, dict):
+            continue
+        text = (item.get("text") or "").strip()
+        if len(match_key(text)) < 4:
+            continue
+        out.append({"text": text, "voice": str(path.relative_to(game_dir)), "path": path})
+    return out
+
+
 def build_map(game_dirs: list[str]) -> dict:
     index: dict[str, dict] = {}
     durations = load_durations()
@@ -565,6 +634,28 @@ def build_map(game_dirs: list[str]) -> dict:
                     continue
         pairings[game_dir.name] = pairing
         stats["games"] += 1
+        if engine == "rpgmaker":
+            try:
+                heard = asr_scan(game_dir, {p for p in (resolver(game_dir, v) for _t, v, _s in pairs) if p},
+                                 asr_cfg)
+            except OSError as exc:
+                log(f"asr scan failed: {exc}")
+                heard = []
+            for item in heard:
+                key = match_key(item["text"])
+                if len(key) < 4 or key in index:
+                    continue
+                audio = item["path"]
+                index[key] = {
+                    "text": item["text"],
+                    "voice": item["voice"],
+                    "audio": str(audio),
+                    "speaker": "",
+                    "engine": "asr",
+                    "game": game_dir.name,
+                    "seconds": durations.get(str(audio)) or probe_duration(audio) or 0.0,
+                }
+                stats["lines"] += 1
         grouped: dict[str, list[tuple]] = {}
         for text, voice, speaker in pairs:
             key = match_key(text)
@@ -649,8 +740,10 @@ def find_voice(items: dict, speakers: set[str], sentence: str,
     """Card text is often a truncated/cropped piece of the game line (OCR cut),
     so we accept a game line when almost the whole card text sits inside it."""
     key = match_key(sentence)
+    if key in items and len(key) >= 4:
+        return items[key]
     for speaker in speakers:
-        key = key.replace(speaker, "")
+        key = key.replace(speaker, "") if len(key) - len(speaker) >= 6 else key
     if len(key) < min_block:
         return None
     if key in items:
@@ -671,6 +764,37 @@ def find_voice(items: dict, speakers: set[str], sentence: str,
         if score > best_score:
             best, best_score = entry, score
     return best if best_score > 0 else None
+
+
+def find_lines(items: dict, speakers: set[str], sentence: str,
+               take: float = 0.62) -> list[dict]:
+    """Every game line spoken inside this card, in reading order.
+
+    A card often shows two or three message windows plus a menu label, so a
+    single-line match would cut the audio in half. Each displayed line is
+    matched on its own and the voices are then glued back together.
+    """
+    out: list[dict] = []
+    for raw in re.split(r"<br\s*/?>|[\r\n]+", sentence or ""):
+        line = re.sub(r"<[^>]+>", "", raw).strip()
+        key = match_key(line)
+        if len(key) < 4:
+            continue
+        if "合体攻略" in line or "すけべすごろく" in line or key in speakers:
+            continue
+        best, best_score = None, 0.0
+        for candidate, entry in items.items():
+            if key in candidate or candidate in key:
+                score = 1.0
+            else:
+                score = difflib.SequenceMatcher(None, key, candidate, autojunk=False).ratio()
+            score -= 0.02 * abs(len(candidate) - len(key)) / max(len(key), 1)
+            if score > best_score:
+                best, best_score = entry, score
+        if best is not None and best_score >= take:
+            if not out or out[-1].get("voice") != best.get("voice"):
+                out.append(best)
+    return out
 
 
 # ------------------------------------------------------------------ anki write
@@ -947,15 +1071,39 @@ def to_mp3(source: Path) -> tuple[Path, str]:
 
 
 def attach(note: dict, entry: dict, sentence_field: str, audio_field: str) -> str:
+    return attach_many(note, [entry], sentence_field, audio_field)
+
+
+def attach_many(note: dict, entries: list[dict], sentence_field: str, audio_field: str) -> str:
+    """Put the voice of one or several game lines on the card."""
     fields = note["fields"]
     field = pick_field(fields, audio_field)
     if field is None:
         return f"no audio field on {note.get('modelName')}"
-    source = Path(entry["audio"])
-    if not source.is_file():
-        return f"missing {source.name}"
-    media, ext = to_mp3(source)
-    media_name = f"gv_{source.stem}.{ext}"
+    sources = [Path(e["audio"]) for e in entries
+               if e.get("audio") and Path(str(e["audio"])).is_file()]
+    if not sources:
+        return "missing voice file"
+    if len(sources) == 1:
+        media, ext = to_mp3(sources[0])
+        media_name = f"gv_{sources[0].stem}.{ext}"
+    else:
+        ffmpeg = ffmpeg_path()
+        if not ffmpeg:
+            media, ext = to_mp3(sources[0])
+            media_name = f"gv_{sources[0].stem}.{ext}"
+        else:
+            target = Path(tempfile.gettempdir()) / f"gv_{sources[0].stem}_{len(sources)}.mp3"
+            args = [ffmpeg, "-y", "-loglevel", "error"]
+            for source in sources:
+                args += ["-i", str(source)]
+            filt = "".join(f"[{i}:a]apad=pad_dur=0.12[a{i}];" for i in range(len(sources)))
+            filt += "".join(f"[a{i}]" for i in range(len(sources)))
+            filt += f"concat=n={len(sources)}:v=0:a=1[out]"
+            args += ["-filter_complex", filt, "-map", "[out]",
+                     "-codec:a", "libmp3lame", "-q:a", "4", str(target)]
+            subprocess.run(args, check=True)
+            media, media_name = target, target.name
     anki("storeMediaFile", filename=media_name,
          data=base64.b64encode(media.read_bytes()).decode("ascii"))
     anki("updateNoteFields", note={"id": note["noteId"], "fields": {field: f"[sound:{media_name}]"}})
@@ -1023,7 +1171,8 @@ def main():
                 except RuntimeError as exc:
                     log(f"clean failed {note['noteId']}: {exc}")
 
-        entry = find_voice(items, speakers, sentence)
+        picked = find_lines(items, speakers, sentence)
+        entry = picked[0] if picked else find_voice(items, speakers, sentence)
         tags_add: list[str] = []
         tags_remove: list[str] = []
         game = gsm_games.get(str(note["noteId"])) or (entry or {}).get("game", "")
@@ -1036,7 +1185,7 @@ def main():
         if entry:
             if not exact_done:
                 try:
-                    result = attach(note, entry, "Sentence", "Sentence Audio")
+                    result = attach_many(note, picked or [entry], "Sentence", "Sentence Audio")
                     polished += 1
                     log(f"{note['noteId']}: {result} ({entry['voice']})")
                 except (RuntimeError, urllib.error.URLError, OSError,
