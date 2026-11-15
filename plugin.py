@@ -551,6 +551,9 @@ def asr_scan(game_dir: Path, known: set[Path], config: dict) -> list[dict]:
             continue
         if isinstance(item, dict) and item.get("mtime") == mtime and item.get("text"):
             continue
+        seconds = probe_duration(path)
+        if seconds is None or seconds < 0.3 or seconds > 30:
+            continue  # music, PVs or a broken file - not a spoken line
         todo.append(path)
         if len(todo) >= budget:
             break
